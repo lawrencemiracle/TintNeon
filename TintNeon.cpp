@@ -5,6 +5,7 @@
 //   Numpad 8 / Numpad 2 = move, Numpad 5 = apply, Numpad 0 (or same key again) = close.
 // Config: TintNeon.ini next to the .asi (keys, prices, presets). Built-in defaults if missing.
 // the project plugin-sdk generates may use a precompiled header; it must be the very first include
+#define _CRT_SECURE_NO_WARNINGS
 #if __has_include("stdafx.h")
 #include "stdafx.h"
 #endif
@@ -101,7 +102,7 @@ static void LoadConfig() {
 }
 
 // ============================ glass tint ============================
-struct Saved { RwMaterial* mat; RwRGBA col; };
+struct Saved { RpMaterial* mat; RwRGBA col; };
 static std::vector<Saved> g_saved;
 
 static bool IsEditableKey(const RwRGBA& c) {
@@ -109,14 +110,14 @@ static bool IsEditableKey(const RwRGBA& c) {
            (c.red == 0   && c.green == 255 && c.blue == 255) || (c.red == 255 && c.green == 0   && c.blue == 255);
 }
 // Heuristic: translucent and not a body-colour key. Verify on your own car models.
-static bool IsGlass(RwMaterial* m) { const RwRGBA* c = RwMaterialGetColor(m); return c->alpha < 255 && !IsEditableKey(*c); }
+static bool IsGlass(RpMaterial* m) { const RwRGBA* c = &m->color; return c->alpha < 255 && !IsEditableKey(*c); }
 
 static RpMaterial* MatCB(RpMaterial* m, void* d) {
     if (!IsGlass(m)) return m;
     const TintState* t = (const TintState*)d;
-    g_saved.push_back({ m, *RwMaterialGetColor(m) });
+    g_saved.push_back({ m, m->color });
     RwRGBA c = { (RwUInt8)t->r, (RwUInt8)t->g, (RwUInt8)t->b, (RwUInt8)t->a };
-    RpMaterialSetColor(m, &c);
+    m->color = c;
     return m;
 }
 static RpAtomic* AtomicCB(RpAtomic* a, void* d) {
@@ -129,7 +130,7 @@ static void TintBefore(CVehicle* v) {
     RpClumpForAllAtomics(v->m_pRwClump, AtomicCB, &it->second);   // materials are shared per model -> restore after
 }
 static void TintAfter(CVehicle*) {
-    for (auto& s : g_saved) RpMaterialSetColor(s.mat, &s.col);
+    for (auto& s : g_saved) s.mat->color = s.col;
     g_saved.clear();
 }
 
