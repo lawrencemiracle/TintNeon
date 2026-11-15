@@ -19,6 +19,21 @@ jobs:
 
       - uses: microsoft/setup-msbuild@v2
 
+      - name: Dump the plugin-sdk headers for the game's own menu and text system
+        shell: pwsh
+        run: |
+          $out = "$env:GITHUB_WORKSPACE\sdk_headers.log"
+          $dir = "C:\plugin-sdk\plugin_sa\game_sa"
+          foreach ($n in 'CMenuSystem','CText','CKeyArray','CData','CKeyEntry','CMenuManager') {
+            Get-ChildItem $dir -Filter "$n.h" -ErrorAction SilentlyContinue | ForEach-Object {
+              "=== $($_.Name)" | Out-File -Append $out
+              Get-Content $_.FullName | Out-File -Append $out
+            }
+          }
+          "=== files mentioning CKeyEntry / CMenuSystem::CreateNewMenu" | Out-File -Append $out
+          Get-ChildItem $dir -Include *.h,*.cpp -Recurse | Select-String -Pattern 'CKeyEntry|CreateNewMenu|SetColumnWidth|SetActiveMenuItem|GetCurrentMenuItem' | ForEach-Object { "$($_.Path):$($_.LineNumber): $($_.Line.Trim())" } | Out-File -Append $out
+
+
       - name: Make dummy game folder (project post-build step copies the .asi there)
         shell: pwsh
         run: New-Item -ItemType Directory -Force C:\gta_out\scripts | Out-Null
