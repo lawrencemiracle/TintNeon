@@ -4,6 +4,10 @@
 // Usage: in a tuning garage (or anywhere if AllowAnywhere=1) press [4] tint menu, [5] neon menu.
 //   Numpad 8 / Numpad 2 = move, Numpad 5 = apply, Numpad 0 (or same key again) = close.
 // Config: TintNeon.ini next to the .asi (keys, prices, presets). Built-in defaults if missing.
+// the project plugin-sdk generates may use a precompiled header; it must be the very first include
+#if __has_include("stdafx.h")
+#include "stdafx.h"
+#endif
 // plugin-sdk's injector.hpp forgets these standard headers on newer MSVC -> include them first
 #include <type_traits>
 #include <functional>
