@@ -29,7 +29,14 @@ jobs:
       - name: Build plugin-sdk library (Win32, GTA SA)
         shell: pwsh
         run: |
-          $proj = Get-ChildItem C:\plugin-sdk -Recurse -Filter "plugin_sa.vcxproj" | Select-Object -First 1
+          $projs = Get-ChildItem C:\plugin-sdk -Recurse -Filter *.vcxproj
+          $projs | ForEach-Object { $_.FullName } | Out-File layout.log
+          Get-ChildItem C:\plugin-sdk -Depth 2 | ForEach-Object { $_.FullName } | Out-File -Append layout.log
+          Write-Host "Projects found:"; $projs | ForEach-Object { Write-Host $_.FullName }
+          $proj = $projs | Where-Object { $_.FullName -match 'plugin_sa' } | Select-Object -First 1
+          if (-not $proj) { $proj = $projs | Where-Object { $_.Name -match 'plugin' } | Select-Object -First 1 }
+          if (-not $proj) { Write-Host "NO PROJECT FOUND"; exit 0 }
+          Write-Host "Building $($proj.FullName)"
           msbuild $proj.FullName /p:Configuration=Release /p:Platform=Win32 /p:PlatformToolset=v143 /m 2>&1 | Tee-Object -FilePath sdk_build.log
         env:
           PLUGIN_SDK_DIR: C:\plugin-sdk
@@ -37,7 +44,8 @@ jobs:
 
       - name: Locate plugin library
         shell: pwsh
-        run: Get-ChildItem C:\plugin-sdk -Recurse -Include *.lib | Select-Object FullName
+        run: |
+          Get-ChildItem C:\plugin-sdk -Recurse -Include *.lib | ForEach-Object { $_.FullName } | Tee-Object -FilePath libs.log
 
       - name: Compile TintNeon.asi
         shell: cmd
