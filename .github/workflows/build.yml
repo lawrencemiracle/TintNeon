@@ -37,13 +37,20 @@ jobs:
           else { Write-Host "NO generated cpp found" }
         continue-on-error: true
 
-      - name: Build generated project (Release, Win32)
+      - name: Build generated project (Release)
         shell: pwsh
         run: |
-          $sln = Get-ChildItem C:\proj -Recurse -Include *.sln,*.slnx | Select-Object -First 1
-          if (-not $sln) { Write-Host "NO SOLUTION FOUND"; exit 0 }
-          Write-Host "Building $($sln.FullName)"
-          msbuild $sln.FullName /p:Configuration=Release /p:Platform=Win32 /m 2>&1 | Tee-Object -FilePath $env:GITHUB_WORKSPACE\compile.log
+          $proj = "C:\proj\TintNeon.vcxproj"
+          Copy-Item $proj "$env:GITHUB_WORKSPACE\TintNeon_vcxproj.log"
+          $xml = Get-Content $proj -Raw
+          $cfgs = [regex]::Matches($xml, '<ProjectConfiguration Include="([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
+          "Configurations: $($cfgs -join ' ; ')" | Tee-Object -FilePath "$env:GITHUB_WORKSPACE\configs.log"
+          $pick = $cfgs | Where-Object { $_ -match '^Release\|' } | Select-Object -First 1
+          if (-not $pick) { $pick = $cfgs | Where-Object { $_ -match 'Release' } | Select-Object -First 1 }
+          if (-not $pick) { Write-Host "NO Release CONFIG"; exit 0 }
+          $conf, $plat = $pick.Split('|')
+          Write-Host "Building $conf | $plat"
+          msbuild $proj /p:Configuration="$conf" /p:Platform="$plat" /p:PlatformToolset=v143 /m 2>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE\compile.log"
         continue-on-error: true
 
       - name: Collect the .asi
