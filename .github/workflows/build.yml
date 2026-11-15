@@ -5,6 +5,7 @@ on:
 
 env:
   PLUGIN_SDK_DIR: C:\plugin-sdk
+  GTA_SA_DIR: C:\gta_out
 
 jobs:
   build:
@@ -17,6 +18,37 @@ jobs:
         run: git clone --depth 1 https://github.com/DK22Pac/plugin-sdk.git C:\plugin-sdk
 
       - uses: microsoft/setup-msbuild@v2
+
+      - name: Make dummy game folder (project post-build step copies the .asi there)
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force C:\gta_out\scripts | Out-Null
+
+      - name: Build the plugin-sdk library (Plugin.lib)
+        shell: pwsh
+        run: |
+          $ws = $env:GITHUB_WORKSPACE
+          Set-Location C:\plugin-sdk\tools\premake
+          Get-Content premake5.lua | Out-File "$ws\premake5_full.log"
+          .\premake5.exe vs2022 2>&1 | Tee-Object -FilePath "$ws\premake_lib.log"
+          $projs = Get-ChildItem C:\plugin-sdk -Recurse -Filter *.vcxproj
+          $projs | ForEach-Object { $_.FullName } | Out-File "$ws\libproj.log"
+          $cands = $projs | Where-Object { $_.Name -match 'plugin' -and $_.Name -notmatch 'unreal|_vc|_III|_IV|_II|iii' }
+          foreach ($c in $cands) {
+            $xml = Get-Content $c.FullName -Raw
+            $cfgs = [regex]::Matches($xml, '<ProjectConfiguration Include="([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
+            "$($c.Name): $($cfgs -join ' ; ')" | Out-File -Append "$ws\libproj.log"
+            $pick = $cfgs | Where-Object { $_ -match 'Release' -and $_ -match 'SA' } | Select-Object -First 1
+            if (-not $pick) { $pick = $cfgs | Where-Object { $_ -match 'Release' } | Select-Object -First 1 }
+            if (-not $pick) { continue }
+            $conf, $plat = $pick.Split('|')
+            Write-Host "Building $($c.Name) as $conf | $plat"
+            msbuild $c.FullName /p:Configuration="$conf" /p:Platform="$plat" /p:PlatformToolset=v143 /m 2>&1 | Tee-Object -FilePath "$ws\libbuild_$($c.BaseName).log"
+          }
+          New-Item -ItemType Directory -Force C:\plugin-sdk\output\lib | Out-Null
+          $lib = Get-ChildItem C:\plugin-sdk -Recurse -Filter Plugin.lib | Select-Object -First 1
+          if ($lib) { Write-Host "Found $($lib.FullName)"; if ($lib.DirectoryName -ne 'C:\plugin-sdk\output\lib') { Copy-Item $lib.FullName C:\plugin-sdk\output\lib\Plugin.lib -Force } }
+          Get-ChildItem C:\plugin-sdk -Recurse -Include *.lib | Where-Object { $_.FullName -notmatch '\\shared\\' } | ForEach-Object { $_.FullName } | Out-File "$ws\libs.log"
+        continue-on-error: true
 
       - name: Let plugin-sdk generate an ASI project for GTA SA
         shell: pwsh
@@ -56,7 +88,7 @@ jobs:
       - name: Collect the .asi
         shell: pwsh
         run: |
-          Get-ChildItem C:\proj -Recurse -Filter *.asi | ForEach-Object { Copy-Item $_.FullName $env:GITHUB_WORKSPACE\TintNeon.asi -Force; Write-Host "Found $($_.FullName)" }
+          Get-ChildItem C:\proj,C:\gta_out -Recurse -Filter *.asi | ForEach-Object { Copy-Item $_.FullName $env:GITHUB_WORKSPACE\TintNeon.asi -Force; Write-Host "Found $($_.FullName)" }
 
       - name: Upload result and logs
         if: always()
