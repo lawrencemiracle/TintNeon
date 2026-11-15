@@ -3,6 +3,9 @@ on:
   workflow_dispatch:
   push:
 
+env:
+  PLUGIN_SDK_DIR: C:\plugin-sdk
+
 jobs:
   build:
     runs-on: windows-2022
@@ -15,46 +18,38 @@ jobs:
 
       - uses: microsoft/setup-msbuild@v2
 
-      - name: Generate plugin-sdk solution with premake
+      - name: Let plugin-sdk generate an ASI project for GTA SA
         shell: pwsh
         run: |
           Set-Location C:\plugin-sdk\tools\premake
-          Get-Content premake5.lua -TotalCount 80 | Out-File $env:GITHUB_WORKSPACE\premake_lua_head.log
-          .\premake5.exe --help 2>&1 | Out-File $env:GITHUB_WORKSPACE\premake_help.log
-          .\premake5.exe vs2022 2>&1 | Tee-Object -FilePath $env:GITHUB_WORKSPACE\premake_run.log
-          Get-ChildItem C:\plugin-sdk -Recurse -Include *.sln,*.vcxproj | ForEach-Object { $_.FullName } | Tee-Object -FilePath $env:GITHUB_WORKSPACE\layout.log
+          New-Item -ItemType Directory -Force C:\proj | Out-Null
+          .\premake5.exe newplugin --name=TintNeon --type=ASI --gtasa --dir=C:\proj --pluginsdkdir=C:\plugin-sdk 2>&1 | Tee-Object -FilePath $env:GITHUB_WORKSPACE\premake_run.log
+          Get-ChildItem C:\proj -Recurse | ForEach-Object { $_.FullName } | Tee-Object -FilePath $env:GITHUB_WORKSPACE\layout.log
         continue-on-error: true
 
-      - name: Build plugin_sa library (Release, Win32)
+      - name: Put TintNeon.cpp into the generated project
         shell: pwsh
         run: |
-          $projs = Get-ChildItem C:\plugin-sdk -Recurse -Filter *.vcxproj
-          $proj = $projs | Where-Object { $_.Name -match '^plugin_sa\.vcxproj$' } | Select-Object -First 1
-          if (-not $proj) { $proj = $projs | Where-Object { $_.Name -match 'plugin_sa' -and $_.Name -notmatch 'unreal' } | Select-Object -First 1 }
-          if (-not $proj) { Write-Host "NO plugin_sa PROJECT FOUND"; exit 0 }
-          Write-Host "Building $($proj.FullName)"
-          msbuild $proj.FullName /p:Configuration=Release /p:Platform=Win32 /m 2>&1 | Tee-Object -FilePath $env:GITHUB_WORKSPACE\sdk_build.log
+          $cpps = Get-ChildItem C:\proj -Recurse -Filter *.cpp | Where-Object { $_.FullName -notmatch 'plugin-sdk' }
+          $cpps | ForEach-Object { $_.FullName } | Out-File $env:GITHUB_WORKSPACE\cpps.log
+          $main = $cpps | Select-Object -First 1
+          if ($main) { Copy-Item $env:GITHUB_WORKSPACE\TintNeon.cpp $main.FullName -Force; Write-Host "Replaced $($main.FullName)" }
+          else { Write-Host "NO generated cpp found" }
         continue-on-error: true
 
-      - name: Locate plugin library
+      - name: Build generated project (Release, Win32)
         shell: pwsh
         run: |
-          Get-ChildItem C:\plugin-sdk -Recurse -Include *.lib | Where-Object { $_.FullName -notmatch '\\shared\\' } | ForEach-Object { $_.FullName } | Tee-Object -FilePath libs.log
+          $sln = Get-ChildItem C:\proj -Recurse -Include *.sln,*.slnx | Select-Object -First 1
+          if (-not $sln) { Write-Host "NO SOLUTION FOUND"; exit 0 }
+          Write-Host "Building $($sln.FullName)"
+          msbuild $sln.FullName /p:Configuration=Release /p:Platform=Win32 /m 2>&1 | Tee-Object -FilePath $env:GITHUB_WORKSPACE\compile.log
+        continue-on-error: true
 
-      - name: Compile TintNeon.asi
-        shell: cmd
+      - name: Collect the .asi
+        shell: pwsh
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars32.bat"
-          set SDK=C:\plugin-sdk
-          set PLIB=
-          for /f "delims=" %%i in ('dir /s /b %SDK%\plugin*.lib 2^>nul ^| findstr /v /i "unreal plugin_vc plugin_III plugin_IV plugin_II"') do set PLIB=%%i
-          echo Using library: [%PLIB%] > compile.log
-          cl /nologo /std:c++20 /Zc:__cplusplus /EHsc /O2 /MT /LD /Fe:TintNeon.asi TintNeon.cpp ^
-            /DGTASA /DPLUGIN_SGV_10US /D_CRT_SECURE_NO_WARNINGS /D_USE_MATH_DEFINES /DNOMINMAX ^
-            /I%SDK%\plugin_sa /I%SDK%\plugin_sa\game_sa /I%SDK%\shared /I%SDK%\shared\game /I%SDK% ^
-            /I%SDK%\safetyhook /I%SDK%\injector /I%SDK%\hooking /I%SDK%\modutils ^
-            /link /MACHINE:X86 /LIBPATH:%SDK%\shared\rwd3d9 /LIBPATH:%SDK%\shared\dxsdk "%PLIB%" user32.lib >> compile.log 2>&1
-          type compile.log
+          Get-ChildItem C:\proj -Recurse -Filter *.asi | ForEach-Object { Copy-Item $_.FullName $env:GITHUB_WORKSPACE\TintNeon.asi -Force; Write-Host "Found $($_.FullName)" }
 
       - name: Upload result and logs
         if: always()
