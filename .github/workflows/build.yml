@@ -1,6 +1,6 @@
 name: Build TintNeon.asi
 on:
-  workflow_dispatch:      # lets you press "Run workflow" manually
+  workflow_dispatch:
   push:
 
 jobs:
@@ -13,53 +13,47 @@ jobs:
         shell: pwsh
         run: git clone --depth 1 https://github.com/DK22Pac/plugin-sdk.git C:\plugin-sdk
 
-      - name: Install DirectX SDK headers
-        shell: pwsh
-        run: choco install directx-sdk -y --no-progress
-        continue-on-error: true
-
       - uses: microsoft/setup-msbuild@v2
 
-      - name: Show plugin-sdk layout (for debugging)
+      - name: Generate plugin-sdk solution with premake
         shell: pwsh
         run: |
-          Get-ChildItem C:\plugin-sdk -Depth 1 | Select-Object FullName
-          Get-ChildItem C:\plugin-sdk -Recurse -Filter *.vcxproj | Select-Object FullName
+          Set-Location C:\plugin-sdk\tools\premake
+          Get-Content premake5.lua -TotalCount 80 | Out-File $env:GITHUB_WORKSPACE\premake_lua_head.log
+          .\premake5.exe --help 2>&1 | Out-File $env:GITHUB_WORKSPACE\premake_help.log
+          .\premake5.exe vs2022 2>&1 | Tee-Object -FilePath $env:GITHUB_WORKSPACE\premake_run.log
+          Get-ChildItem C:\plugin-sdk -Recurse -Include *.sln,*.vcxproj | ForEach-Object { $_.FullName } | Tee-Object -FilePath $env:GITHUB_WORKSPACE\layout.log
+        continue-on-error: true
 
-      - name: Build plugin-sdk library (Win32, GTA SA)
+      - name: Build plugin_sa library (Release, Win32)
         shell: pwsh
         run: |
           $projs = Get-ChildItem C:\plugin-sdk -Recurse -Filter *.vcxproj
-          $projs | ForEach-Object { $_.FullName } | Out-File layout.log
-          Get-ChildItem C:\plugin-sdk -Depth 2 | ForEach-Object { $_.FullName } | Out-File -Append layout.log
-          Write-Host "Projects found:"; $projs | ForEach-Object { Write-Host $_.FullName }
-          $proj = $projs | Where-Object { $_.FullName -match 'plugin_sa' } | Select-Object -First 1
-          if (-not $proj) { $proj = $projs | Where-Object { $_.Name -match 'plugin' } | Select-Object -First 1 }
-          if (-not $proj) { Write-Host "NO PROJECT FOUND"; exit 0 }
+          $proj = $projs | Where-Object { $_.Name -match '^plugin_sa\.vcxproj$' } | Select-Object -First 1
+          if (-not $proj) { $proj = $projs | Where-Object { $_.Name -match 'plugin_sa' -and $_.Name -notmatch 'unreal' } | Select-Object -First 1 }
+          if (-not $proj) { Write-Host "NO plugin_sa PROJECT FOUND"; exit 0 }
           Write-Host "Building $($proj.FullName)"
-          msbuild $proj.FullName /p:Configuration=Release /p:Platform=Win32 /p:PlatformToolset=v143 /m 2>&1 | Tee-Object -FilePath sdk_build.log
-        env:
-          PLUGIN_SDK_DIR: C:\plugin-sdk
+          msbuild $proj.FullName /p:Configuration=Release /p:Platform=Win32 /m 2>&1 | Tee-Object -FilePath $env:GITHUB_WORKSPACE\sdk_build.log
         continue-on-error: true
 
       - name: Locate plugin library
         shell: pwsh
         run: |
-          Get-ChildItem C:\plugin-sdk -Recurse -Include *.lib | ForEach-Object { $_.FullName } | Tee-Object -FilePath libs.log
+          Get-ChildItem C:\plugin-sdk -Recurse -Include *.lib | Where-Object { $_.FullName -notmatch '\\shared\\' } | ForEach-Object { $_.FullName } | Tee-Object -FilePath libs.log
 
       - name: Compile TintNeon.asi
         shell: cmd
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars32.bat"
           set SDK=C:\plugin-sdk
-          for /f "delims=" %%i in ('dir /s /b %SDK%\plugin.lib 2^>nul') do set PLIB=%%i
-          if not defined PLIB for /f "delims=" %%i in ('dir /s /b %SDK%\*plugin*sa*.lib 2^>nul') do set PLIB=%%i
-          echo Using library: %PLIB%
-          cl /nologo /std:c++17 /EHsc /O2 /MT /LD /Fe:TintNeon.asi TintNeon.cpp ^
+          set PLIB=
+          for /f "delims=" %%i in ('dir /s /b %SDK%\plugin*.lib 2^>nul ^| findstr /v /i "unreal plugin_vc plugin_III plugin_IV plugin_II"') do set PLIB=%%i
+          echo Using library: [%PLIB%] > compile.log
+          cl /nologo /std:c++20 /Zc:__cplusplus /EHsc /O2 /MT /LD /Fe:TintNeon.asi TintNeon.cpp ^
             /DGTASA /DPLUGIN_SGV_10US /D_CRT_SECURE_NO_WARNINGS /D_USE_MATH_DEFINES /DNOMINMAX ^
-            /I%SDK%\plugin_sa /I%SDK%\plugin_sa\game_sa /I%SDK%\shared /I%SDK%\shared\game ^
-            /I"C:\Program Files (x86)\Microsoft DirectX SDK (June 2010)\Include" ^
-            /link /MACHINE:X86 "%PLIB%" user32.lib 2>&1 > compile.log
+            /I%SDK%\plugin_sa /I%SDK%\plugin_sa\game_sa /I%SDK%\shared /I%SDK%\shared\game /I%SDK% ^
+            /I%SDK%\safetyhook /I%SDK%\injector /I%SDK%\hooking /I%SDK%\modutils ^
+            /link /MACHINE:X86 /LIBPATH:%SDK%\shared\rwd3d9 /LIBPATH:%SDK%\shared\dxsdk "%PLIB%" user32.lib >> compile.log 2>&1
           type compile.log
 
       - name: Upload result and logs
