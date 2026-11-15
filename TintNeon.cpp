@@ -4,6 +4,16 @@
 // Usage: in a tuning garage (or anywhere if AllowAnywhere=1) press [4] tint menu, [5] neon menu.
 //   Numpad 8 / Numpad 2 = move, Numpad 5 = apply, Numpad 0 (or same key again) = close.
 // Config: TintNeon.ini next to the .asi (keys, prices, presets). Built-in defaults if missing.
+// plugin-sdk's injector.hpp forgets these standard headers on newer MSVC -> include them first
+#include <type_traits>
+#include <functional>
+#include <utility>
+#include <cstdint>
+#include <cstddef>
+#include <cstring>
+#include <cctype>
+#include <cstdlib>
+#include <windows.h>
 #include "plugin.h"
 #include "common.h"
 #include "CFont.h"
