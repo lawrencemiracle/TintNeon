@@ -1,7 +1,7 @@
 // TintNeon.asi - window tint + neon with an in-game menu, ASI only (no CLEO needed).
 // plugin-sdk, Win32/x86.  NOT COMPILED OR TESTED - expect small API-name fixes on first build.
 //
-// Usage: in a tuning garage (or anywhere if AllowAnywhere=1) press [4] tint menu, [5] neon menu.
+// Usage: in a tuning garage (or anywhere if AllowAnywhere=1) press [4] to open the Tint & Neon menu.
 //   Numpad 8 / Numpad 2 = move, Numpad 5 = apply, Numpad 0 (or same key again) = close.
 // Config: TintNeon.ini next to the .asi (keys, prices, presets). Built-in defaults if missing.
 // the project plugin-sdk generates may use a precompiled header; it must be the very first include
@@ -49,7 +49,7 @@ static std::vector<Preset> g_tintPresets, g_neonPresets;
 static std::unordered_map<CVehicle*, TintState> g_tint;
 static std::unordered_map<CVehicle*, NeonState> g_neon;
 
-static int  g_keyTint = '4', g_keyNeon = '5';
+static int  g_keyMenu = '4';
 static int  g_keyUp = VK_NUMPAD8, g_keyDown = VK_NUMPAD2, g_keyApply = VK_NUMPAD5, g_keyClose = VK_NUMPAD0;
 static bool g_pricing = true, g_anywhere = false;
 
@@ -94,7 +94,7 @@ static void LoadConfig() {
     std::string ini = IniPath();
     g_pricing  = GetPrivateProfileIntA("Settings", "EnablePricing", 1, ini.c_str()) != 0;
     g_anywhere = GetPrivateProfileIntA("Settings", "AllowAnywhere", 0, ini.c_str()) != 0;
-    g_keyTint  = ParseKey(ini, "KeyTint", g_keyTint);   g_keyNeon  = ParseKey(ini, "KeyNeon", g_keyNeon);
+    g_keyMenu  = ParseKey(ini, "KeyMenu", g_keyMenu);
     g_keyUp    = ParseKey(ini, "KeyUp", g_keyUp);       g_keyDown  = ParseKey(ini, "KeyDown", g_keyDown);
     g_keyApply = ParseKey(ini, "KeyApply", g_keyApply); g_keyClose = ParseKey(ini, "KeyClose", g_keyClose);
     LoadPresets(ini, "Tint", false, g_tintPresets);
@@ -207,8 +207,13 @@ static void ApplyNeon(CVehicle* v, int row) {
 }
 
 // ============================ menu ============================
-enum { MENU_NONE, MENU_TINT, MENU_NEON };
-static int  g_menu = MENU_NONE, g_row = 0;
+// One combined panel: a "Window Tint" section and a "Neon" section.
+// While open it hides the garage's normal left-hand tuning menu (same patch the SB handling script uses).
+enum RowType { ROW_HEADER, ROW_TINT, ROW_NEON };
+struct MenuRow { RowType type; int idx; };
+static std::vector<MenuRow> g_rows;
+static bool g_open = false, g_leftHidden = false;
+static int  g_sel = 0;
 static char g_msg[64] = ""; static unsigned g_msgUntil = 0;
 static bool g_prev[256];
 
@@ -220,72 +225,119 @@ static bool Pressed(int vk) {                       // edge-triggered key press
 static bool InGarageMenu(CVehicle* v) {
     if (!v) return false;
     if (g_anywhere) return true;
-    return *(uint8_t*)0xBA82E3 > 0;                 // game's "menu in use" flag (same one your script polls)
+    return *(uint8_t*)0xBA82E3 > 0;                 // game's "menu in use" flag
 }
 static int  Money()            { return CWorld::Players[0].m_nMoney; }
 static void SetMoney(int m)    { CWorld::Players[0].m_nMoney = m; }
 static void Msg(const char* s) { strncpy(g_msg, s, 63); g_msgUntil = CTimer::m_snTimeInMilliseconds + 2000; }
 
+// hide / show the garage's own left menu: bytes 32 DB (original) <-> B3 01 (skip drawing)
+static void HideLeftMenu(bool hide) {
+    volatile uint16_t* a = (volatile uint16_t*)0x582645;
+    if (hide && !g_leftHidden) {
+        if (*a != 0xDB32) return;                    // unexpected exe version: do nothing
+        DWORD old; VirtualProtect((void*)a, 2, PAGE_EXECUTE_READWRITE, &old);
+        *a = 0x01B3; VirtualProtect((void*)a, 2, old, &old); g_leftHidden = true;
+    } else if (!hide && g_leftHidden) {
+        DWORD old; VirtualProtect((void*)a, 2, PAGE_EXECUTE_READWRITE, &old);
+        *a = 0xDB32; VirtualProtect((void*)a, 2, old, &old); g_leftHidden = false;
+    }
+}
+static void BuildRows() {
+    g_rows.clear();
+    g_rows.push_back({ ROW_HEADER, 0 });
+    for (int i = 0; i < (int)g_tintPresets.size(); ++i) g_rows.push_back({ ROW_TINT, i });
+    g_rows.push_back({ ROW_HEADER, 1 });
+    for (int i = 0; i < (int)g_neonPresets.size(); ++i) g_rows.push_back({ ROW_NEON, i });
+}
+static void MoveSel(int dir) {
+    int n = (int)g_rows.size(), i = g_sel;
+    for (int k = 0; k < n; ++k) {
+        i = (i + dir + n) % n;
+        if (g_rows[i].type != ROW_HEADER) { g_sel = i; return; }
+    }
+}
+static void OpenMenu()  { BuildRows(); g_sel = 0; MoveSel(1); g_open = true; HideLeftMenu(true); }
+static void CloseMenu() { g_open = false; HideLeftMenu(false); }
+
+static int InstalledSlot(CVehicle* v, RowType t) {
+    if (t == ROW_TINT) { auto it = g_tint.find(v); return it == g_tint.end() ? 0 : it->second.slot; }
+    auto it = g_neon.find(v); return it == g_neon.end() ? 0 : it->second.slot;
+}
+
 static void Update() {
     CVehicle* v = FindPlayerVehicle(-1, false);
     if (GetForegroundWindow() != RsGlobal.ps->window) return;
-    if (!v || !InGarageMenu(v)) { g_menu = MENU_NONE; for (int k : {g_keyTint,g_keyNeon,g_keyUp,g_keyDown,g_keyApply,g_keyClose}) g_prev[k&255] = (GetAsyncKeyState(k)&0x8000)!=0; return; }
+    if (!v || !InGarageMenu(v)) {
+        if (g_open) CloseMenu();
+        for (int k : { g_keyMenu, g_keyUp, g_keyDown, g_keyApply, g_keyClose }) g_prev[k & 255] = (GetAsyncKeyState(k) & 0x8000) != 0;
+        return;
+    }
+    if (Pressed(g_keyMenu)) { if (g_open) CloseMenu(); else OpenMenu(); }
+    if (!g_open) { Pressed(g_keyUp); Pressed(g_keyDown); Pressed(g_keyApply); Pressed(g_keyClose); return; }
 
-    int kT = Pressed(g_keyTint), kN = Pressed(g_keyNeon);
-    if (kT) { g_menu = (g_menu == MENU_TINT) ? MENU_NONE : MENU_TINT; g_row = 0; }
-    if (kN) { g_menu = (g_menu == MENU_NEON) ? MENU_NONE : MENU_NEON; g_row = 0; }
-    if (g_menu == MENU_NONE) { Pressed(g_keyUp); Pressed(g_keyDown); Pressed(g_keyApply); Pressed(g_keyClose); return; }
-
-    auto& list = (g_menu == MENU_TINT) ? g_tintPresets : g_neonPresets;
-    int n = (int)list.size();
-    if (Pressed(g_keyUp))   g_row = (g_row + n - 1) % n;
-    if (Pressed(g_keyDown)) g_row = (g_row + 1) % n;
-    if (Pressed(g_keyClose)) g_menu = MENU_NONE;
+    if (Pressed(g_keyUp))    MoveSel(-1);
+    if (Pressed(g_keyDown))  MoveSel(+1);
+    if (Pressed(g_keyClose)) { CloseMenu(); return; }
     if (Pressed(g_keyApply)) {
-        int installed = (g_menu == MENU_TINT) ? (g_tint.count(v) ? g_tint[v].slot : 0)
-                                              : (g_neon.count(v) ? g_neon[v].slot : 0);
-        if (g_row == installed) { Msg("Already installed"); return; }
-        int price = g_pricing ? list[g_row].price : 0;
+        const MenuRow& r = g_rows[g_sel];
+        if (r.type == ROW_HEADER) return;
+        if (r.idx == InstalledSlot(v, r.type)) { Msg("Already installed"); return; }
+        auto& list = (r.type == ROW_TINT) ? g_tintPresets : g_neonPresets;
+        int price = g_pricing ? list[r.idx].price : 0;
         if (price > 0) {
             if (Money() < price) { Msg("Not enough money!"); return; }
             SetMoney(Money() - price);
         }
-        if (g_menu == MENU_TINT) ApplyTint(v, g_row); else ApplyNeon(v, g_row);
+        if (r.type == ROW_TINT) ApplyTint(v, r.idx); else ApplyNeon(v, r.idx);
         Msg("Installed");
     }
 }
 
 static void DrawMenu() {
-    if (g_menu == MENU_NONE) return;
+    if (!g_open) return;
     CVehicle* v = FindPlayerVehicle(-1, false);
     if (!v) return;
-    auto& list = (g_menu == MENU_TINT) ? g_tintPresets : g_neonPresets;
-    int installed = (g_menu == MENU_TINT) ? (g_tint.count(v) ? g_tint[v].slot : 0)
-                                          : (g_neon.count(v) ? g_neon[v].slot : 0);
     float sx = RsGlobal.maximumWidth / 640.f, sy = RsGlobal.maximumHeight / 448.f;
-    float x = 25 * sx, y = 145 * sy, w = 200 * sx, rowH = 17 * sy;
-    float h = rowH * (list.size() + 2) + 6 * sy;
+    float x = 25 * sx, y = 145 * sy, w = 160 * sx, rowH = 15 * sy;   // same spot as the SB handling menu
+    float h = rowH * (g_rows.size() + 2) + 8 * sy;
 
-    CSprite2d::DrawRect(CRect(x, y, x + w, y + h), CRGBA(0, 0, 0, 170));
+    CSprite2d::DrawRect(CRect(x, y, x + w, y + h), CRGBA(0, 0, 0, 190));
+    CSprite2d::DrawRect(CRect(x, y, x + w, y + rowH + 2 * sy), CRGBA(30, 30, 30, 230));   // title bar
     CFont::SetBackground(false, false);
     CFont::SetFontStyle(FONT_SUBTITLES);
     CFont::SetProportional(true);
-    CFont::SetScale(0.55f * sx, 1.0f * sy);
-    CFont::SetColor(CRGBA(255, 220, 90, 255));
+    CFont::SetScale(0.5f * sx, 0.95f * sy);
     CFont::SetOrientation(ALIGN_LEFT);
-    CFont::PrintString(x + 6 * sx, y + 4 * sy, (char*)(g_menu == MENU_TINT ? "WINDOW TINT" : "NEON"));
+    CFont::SetColor(CRGBA(255, 255, 255, 255));
+    CFont::PrintString(x + 6 * sx, y + 2 * sy, (char*)"Tint & Neon");
 
-    for (size_t i = 0; i < list.size(); ++i) {
-        float ry = y + 4 * sy + rowH * (i + 1);
-        if ((int)i == g_row) CSprite2d::DrawRect(CRect(x + 2 * sx, ry, x + w - 2 * sx, ry + rowH - 1 * sy), CRGBA(200, 40, 40, 150));
-        CFont::SetColor((int)i == installed ? CRGBA(130, 130, 130, 255) : CRGBA(255, 255, 255, 255));
+    // column headers
+    float hy = y + rowH + 4 * sy;
+    CFont::SetColor(CRGBA(220, 90, 90, 255));
+    CFont::SetOrientation(ALIGN_LEFT);  CFont::PrintString(x + 6 * sx, hy, (char*)"Variant");
+    if (g_pricing) { CFont::SetOrientation(ALIGN_RIGHT); CFont::SetRightJustifyWrap(0.f); CFont::PrintString(x + w - 6 * sx, hy, (char*)"Price"); }
+
+    for (size_t i = 0; i < g_rows.size(); ++i) {
+        const MenuRow& r = g_rows[i];
+        float ry = hy + rowH * (i + 1);
+        if (r.type == ROW_HEADER) {
+            CFont::SetOrientation(ALIGN_LEFT);
+            CFont::SetColor(CRGBA(255, 190, 60, 255));
+            CFont::PrintString(x + 6 * sx, ry, (char*)(r.idx == 0 ? "- Window Tint -" : "- Neon -"));
+            continue;
+        }
+        auto& list = (r.type == ROW_TINT) ? g_tintPresets : g_neonPresets;
+        if ((int)i == g_sel) CSprite2d::DrawRect(CRect(x + 2 * sx, ry, x + w - 2 * sx, ry + rowH - 1 * sy), CRGBA(200, 40, 40, 150));
+        bool installed = (r.idx == InstalledSlot(v, r.type));
+        CFont::SetColor(installed ? CRGBA(130, 130, 130, 255) : CRGBA(255, 255, 255, 255));
         CFont::SetOrientation(ALIGN_LEFT);
-        CFont::PrintString(x + 6 * sx, ry + 1 * sy, (char*)list[i].name.c_str());
+        CFont::PrintString(x + 12 * sx, ry, (char*)list[r.idx].name.c_str());
         if (g_pricing) {
-            char pr[16]; if (list[i].price) sprintf(pr, "$%d", list[i].price); else strcpy(pr, "Free");
+            char pr[16]; if (list[r.idx].price) sprintf(pr, "$%d", list[r.idx].price); else strcpy(pr, "Free");
             CFont::SetOrientation(ALIGN_RIGHT);
             CFont::SetRightJustifyWrap(0.f);
-            CFont::PrintString(x + w - 6 * sx, ry + 1 * sy, pr);
+            CFont::PrintString(x + w - 6 * sx, ry, pr);
         }
     }
     if (g_msgUntil > CTimer::m_snTimeInMilliseconds) {
