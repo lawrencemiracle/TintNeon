@@ -30,6 +30,8 @@ jobs:
               Get-Content $_.FullName | Out-File -Append $out
             }
           }
+          "=== MENU script command names" | Out-File -Append $out
+          Get-ChildItem C:\plugin-sdk -Recurse -Filter ScriptCommands.h | Select-Object -First 1 | ForEach-Object { Select-String -Path $_.FullName -Pattern 'MENU' | ForEach-Object { $_.Line.Trim() } | Out-File -Append $out }
           "=== files mentioning CKeyEntry / CMenuSystem::CreateNewMenu" | Out-File -Append $out
           Get-ChildItem $dir -Include *.h,*.cpp -Recurse | Select-String -Pattern 'CKeyEntry|CreateNewMenu|SetColumnWidth|SetActiveMenuItem|GetCurrentMenuItem' | ForEach-Object { "$($_.Path):$($_.LineNumber): $($_.Line.Trim())" } | Out-File -Append $out
 
