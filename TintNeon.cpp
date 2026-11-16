@@ -1,7 +1,8 @@
 // TintNeon.asi - window tint + neon with an in-game menu, ASI only (no CLEO needed).
 // plugin-sdk, Win32/x86.  NOT COMPILED OR TESTED - expect small API-name fixes on first build.
 //
-// Usage: in a tuning garage (or anywhere if AllowAnywhere=1) press [4] to open the Tint & Neon menu.
+// Usage: in a tuning garage press [4]. The game's own menu panel opens (Window Tint / Neon).
+//   Arrow keys scroll (vanilla), SHIFT selects/applies, ENTER (exit-vehicle button) goes back/closes.
 //   Numpad 8 / Numpad 2 = move, Numpad 5 = apply, Numpad 0 (or same key again) = close.
 // Config: TintNeon.ini next to the .asi (keys, prices, presets). Built-in defaults if missing.
 // the project plugin-sdk generates may use a precompiled header; it must be the very first include
@@ -31,6 +32,9 @@
 #include "CCamera.h"
 #include "CWorld.h"
 #include "CPad.h"
+#include "CText.h"
+#include "CMessages.h"
+#include "extensions/ScriptCommands.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -50,7 +54,6 @@ static std::unordered_map<CVehicle*, TintState> g_tint;
 static std::unordered_map<CVehicle*, NeonState> g_neon;
 
 static int  g_keyMenu = '4';
-static int  g_keyUp = VK_NUMPAD8, g_keyDown = VK_NUMPAD2, g_keyApply = VK_NUMPAD5, g_keyClose = VK_NUMPAD0;
 static bool g_pricing = true, g_anywhere = false;
 
 // ============================ config ============================
@@ -95,8 +98,6 @@ static void LoadConfig() {
     g_pricing  = GetPrivateProfileIntA("Settings", "EnablePricing", 1, ini.c_str()) != 0;
     g_anywhere = GetPrivateProfileIntA("Settings", "AllowAnywhere", 0, ini.c_str()) != 0;
     g_keyMenu  = ParseKey(ini, "KeyMenu", g_keyMenu);
-    g_keyUp    = ParseKey(ini, "KeyUp", g_keyUp);       g_keyDown  = ParseKey(ini, "KeyDown", g_keyDown);
-    g_keyApply = ParseKey(ini, "KeyApply", g_keyApply); g_keyClose = ParseKey(ini, "KeyClose", g_keyClose);
     LoadPresets(ini, "Tint", false, g_tintPresets);
     LoadPresets(ini, "Neon", true,  g_neonPresets);
 }
@@ -206,145 +207,182 @@ static void ApplyNeon(CVehicle* v, int row) {
     g_neon[v] = { p.r, p.g, p.b, p.a, p.mode, row };
 }
 
-// ============================ menu ============================
-// One combined panel: a "Window Tint" section and a "Neon" section.
-// While open it hides the garage's normal left-hand tuning menu (same patch the SB handling script uses).
-enum RowType { ROW_HEADER, ROW_TINT, ROW_NEON };
-struct MenuRow { RowType type; int idx; };
-static std::vector<MenuRow> g_rows;
-static bool g_open = false, g_leftHidden = false;
-static int  g_sel = 0;
-static char g_msg[64] = ""; static unsigned g_msgUntil = 0;
-static bool g_prev[256];
+// ============================ vanilla menu ============================
+// Uses the game's own menu panels (same opcodes your SB handling script uses: create menu, set column,
+// get selected, activate item).  The menu texts come from the GXT, so while the menu is open we temporarily
+// point 28 unused frontend GXT entries (FEM_*) at our own strings and restore them on close.
+static int  Money()         { return CWorld::Players[0].m_nMoney; }
+static void SetMoney(int m) { CWorld::Players[0].m_nMoney = m; }
 
-static bool Pressed(int vk) {                       // edge-triggered key press
-    bool now = (GetAsyncKeyState(vk) & 0x8000) != 0, was = g_prev[vk & 255];
-    g_prev[vk & 255] = now;
-    return now && !was;
-}
-static bool InGarageMenu(CVehicle* v) {
-    if (!v) return false;
-    if (g_anywhere) return true;
-    return *(uint8_t*)0xBA82E3 > 0;                 // game's "menu in use" flag
-}
-static int  Money()            { return CWorld::Players[0].m_nMoney; }
-static void SetMoney(int m)    { CWorld::Players[0].m_nMoney = m; }
-static void Msg(const char* s) { strncpy(g_msg, s, 63); g_msgUntil = CTimer::m_snTimeInMilliseconds + 2000; }
+static const int NSLOT = 28;           // 0 title, 1 header "Variant", 2 header "Price", 3..14 rows, 15..26 prices
+struct GxtSlot { char key[9]; uint32_t* offPtr; uint32_t origOff; char text[48]; };
+static GxtSlot  g_slot[NSLOT];
+static uint8_t* g_dataBase = nullptr;
+static bool     g_gxtReady = false, g_gxtTried = false;
 
-// hide / show the garage's own left menu: bytes 32 DB (original) <-> B3 01 (skip drawing)
-static void HideLeftMenu(bool hide) {
-    volatile uint16_t* a = (volatile uint16_t*)0x582645;
-    if (hide && !g_leftHidden) {
-        if (*a != 0xDB32) return;                    // unexpected exe version: do nothing
-        DWORD old; VirtualProtect((void*)a, 2, PAGE_EXECUTE_READWRITE, &old);
-        *a = 0x01B3; VirtualProtect((void*)a, 2, old, &old); g_leftHidden = true;
-    } else if (!hide && g_leftHidden) {
-        DWORD old; VirtualProtect((void*)a, 2, PAGE_EXECUTE_READWRITE, &old);
-        *a = 0xDB32; VirtualProtect((void*)a, 2, old, &old); g_leftHidden = false;
+static bool InitGxt() {
+    g_gxtTried = true;
+    uint8_t* base = (uint8_t*)&TheText;
+    if (IsBadReadPtr(base, 32)) return false;
+    uint8_t* entries = *(uint8_t**)(base + 0);
+    uint32_t count   = *(uint32_t*)(base + 4);
+    if (!entries || IsBadReadPtr(entries, 12) || count < 300 || count > 1000000) return false;
+    struct Lay { int off, key; } lays[] = { {0, 4}, {8, 0} };
+    int dataOffs[] = { 8, 12, 16, 20, 24 };
+    for (auto& lay : lays) for (int dOff : dataOffs) {
+        uint8_t* data = *(uint8_t**)(base + dOff);
+        if (!data || IsBadReadPtr(data, 16)) continue;
+        int tested = 0, ok = 0;
+        for (uint32_t i = count / 5; i < count && tested < 6; i += count / 9 + 1) {
+            uint8_t* e = entries + (size_t)i * 12;
+            char k[9]; memcpy(k, e + lay.key, 8); k[8] = 0;
+            if (!k[0]) continue;
+            uint32_t off = *(uint32_t*)(e + lay.off);
+            const uint8_t* p = (const uint8_t*)TheText.Get(k);
+            ++tested;
+            if (p == data + off) ++ok;
+        }
+        if (tested < 4 || ok != tested) continue;
+        // layout verified -> collect unused frontend keys
+        int n = 0;
+        for (uint32_t i = 0; i < count && n < NSLOT; ++i) {
+            uint8_t* e = entries + (size_t)i * 12;
+            if (memcmp(e + lay.key, "FEM_", 4) != 0) continue;
+            GxtSlot& sl = g_slot[n];
+            memcpy(sl.key, e + lay.key, 8); sl.key[8] = 0;
+            sl.offPtr = (uint32_t*)(e + lay.off);
+            sl.origOff = *sl.offPtr;
+            sl.text[0] = 0;
+            ++n;
+        }
+        if (n < NSLOT) return false;
+        g_dataBase = data;
+        return true;
     }
+    return false;
 }
-static void BuildRows() {
-    g_rows.clear();
-    g_rows.push_back({ ROW_HEADER, 0 });
-    for (int i = 0; i < (int)g_tintPresets.size(); ++i) g_rows.push_back({ ROW_TINT, i });
-    g_rows.push_back({ ROW_HEADER, 1 });
-    for (int i = 0; i < (int)g_neonPresets.size(); ++i) g_rows.push_back({ ROW_NEON, i });
+static void SetText(int i, const char* t) {
+    strncpy(g_slot[i].text, t, 47); g_slot[i].text[47] = 0;
+    *g_slot[i].offPtr = (uint32_t)((uint8_t*)g_slot[i].text - g_dataBase);
 }
-static void MoveSel(int dir) {
-    int n = (int)g_rows.size(), i = g_sel;
-    for (int k = 0; k < n; ++k) {
-        i = (i + dir + n) % n;
-        if (g_rows[i].type != ROW_HEADER) { g_sel = i; return; }
-    }
-}
-static void OpenMenu()  { BuildRows(); g_sel = 0; MoveSel(1); g_open = true; HideLeftMenu(true); }
-static void CloseMenu() { g_open = false; HideLeftMenu(false); }
+static void RestoreTexts() { for (int i = 0; i < NSLOT; ++i) if (g_slot[i].offPtr) *g_slot[i].offPtr = g_slot[i].origOff; }
 
-static int InstalledSlot(CVehicle* v, RowType t) {
-    if (t == ROW_TINT) { auto it = g_tint.find(v); return it == g_tint.end() ? 0 : it->second.slot; }
+// ---- garage menu plumbing (same memory writes as the SB handling script) ----
+static void WriteU8(uintptr_t a, uint8_t v)   { DWORD o; VirtualProtect((void*)a, 1, PAGE_EXECUTE_READWRITE, &o); *(uint8_t*)a = v;  VirtualProtect((void*)a, 1, o, &o); }
+static void WriteU16(uintptr_t a, uint16_t v) { DWORD o; VirtualProtect((void*)a, 2, PAGE_EXECUTE_READWRITE, &o); *(uint16_t*)a = v; VirtualProtect((void*)a, 2, o, &o); }
+static bool GarageMenuActive(CVehicle* v) { return v && (g_anywhere || *(uint8_t*)0xBA82E3 > 0); }
+
+enum { ST_CLOSED, ST_MAIN, ST_TINT, ST_NEON };
+static int  g_state = ST_CLOSED, g_panel = -1, g_rows = 0;
+static bool g_leftHidden = false, g_enterPending = false, g_prevEnter = false, g_prevShift = false, g_prevOpen = false;
+
+static bool EnterDown() {
+    CPad* pad = CPad::GetPad(0);
+    return (pad && pad->NewState.ButtonTriangle) || (GetAsyncKeyState(VK_RETURN) & 0x8000);
+}
+static int InstalledSlot(CVehicle* v, int state) {
+    if (state == ST_TINT) { auto it = g_tint.find(v); return it == g_tint.end() ? 0 : it->second.slot; }
     auto it = g_neon.find(v); return it == g_neon.end() ? 0 : it->second.slot;
+}
+static void Notify(const char* t) { CMessages::AddMessageJumpQ((char*)t, 2000, 0, false); }
+
+static void RefreshRows(CVehicle* v) {
+    for (int r = 0; r < g_rows; ++r) Command<COMMAND_ACTIVATE_MENU_ITEM>(g_panel, r, 1);
+    if (g_state == ST_TINT || g_state == ST_NEON) {
+        int in = InstalledSlot(v, g_state);
+        if (in >= 0 && in < g_rows) Command<COMMAND_ACTIVATE_MENU_ITEM>(g_panel, in, 0);
+    }
+}
+
+static void DestroyPanel() {
+    if (g_panel >= 0) { Command<COMMAND_DELETE_MENU>(g_panel); g_panel = -1; }
+}
+static void BuildPanel(int state, CVehicle* v) {
+    DestroyPanel();
+    for (int i = 0; i < NSLOT; ++i) SetText(i, "");
+    const std::vector<Preset>* list = nullptr;
+    if (state == ST_TINT) list = &g_tintPresets; else if (state == ST_NEON) list = &g_neonPresets;
+    bool priceCol = (list != nullptr) && g_pricing;
+
+    SetText(0, state == ST_MAIN ? "Tint & Neon" : state == ST_TINT ? "Window Tint" : "Neon");
+    SetText(1, state == ST_MAIN ? "Menu" : "Variant");
+    SetText(2, "Price");
+    if (!list) { SetText(3, "Window Tint"); SetText(4, "Neon"); g_rows = 2; }
+    else {
+        g_rows = std::min<int>((int)list->size(), 12);
+        for (int i = 0; i < g_rows; ++i) {
+            SetText(3 + i, (*list)[i].name.c_str());
+            char pr[16]; if ((*list)[i].price) sprintf(pr, "$%d", (*list)[i].price); else strcpy(pr, "Free");
+            SetText(15 + i, pr);
+        }
+    }
+    g_state = state;
+    int cols = priceCol ? 2 : 1;
+    Command<COMMAND_CREATE_MENU>((char*)g_slot[0].key, 25.0f, 145.0f, 156.0f, cols, 1, 1, 1, &g_panel);
+    Command<COMMAND_SET_MENU_COLUMN>(g_panel, 0, (char*)g_slot[1].key,
+        (char*)g_slot[3].key, (char*)g_slot[4].key, (char*)g_slot[5].key, (char*)g_slot[6].key, (char*)g_slot[7].key, (char*)g_slot[8].key,
+        (char*)g_slot[9].key, (char*)g_slot[10].key, (char*)g_slot[11].key, (char*)g_slot[12].key, (char*)g_slot[13].key, (char*)g_slot[14].key);
+    if (priceCol)
+        Command<COMMAND_SET_MENU_COLUMN>(g_panel, 1, (char*)g_slot[2].key,
+            (char*)g_slot[15].key, (char*)g_slot[16].key, (char*)g_slot[17].key, (char*)g_slot[18].key, (char*)g_slot[19].key, (char*)g_slot[20].key,
+            (char*)g_slot[21].key, (char*)g_slot[22].key, (char*)g_slot[23].key, (char*)g_slot[24].key, (char*)g_slot[25].key, (char*)g_slot[26].key);
+
+    WriteU8(0xBA82E2, 1);                                   // make our panel the active menu
+    Command<COMMAND_SET_ACTIVE_MENU_ITEM>(g_panel, 0);
+    uint32_t cur = *(uint32_t*)0xBA82DC;                    // tell the menu system how many rows it has
+    if (cur) *(uint8_t*)(cur + 0x3F6) = (uint8_t)(g_rows - 1);
+    if (!g_leftHidden && *(uint16_t*)0x582645 == 0xDB32) { WriteU16(0x582645, 0x01B3); g_leftHidden = true; }   // hide left (stock tuning) menu
+    RefreshRows(v);
+}
+static void ClosePanel() {
+    DestroyPanel();
+    RestoreTexts();
+    if (g_leftHidden) { WriteU16(0x582645, 0xDB32); g_leftHidden = false; }
+    WriteU8(0xBA82E2, 0);                                   // back to the stock menu
+    g_state = ST_CLOSED; g_enterPending = false;
 }
 
 static void Update() {
     CVehicle* v = FindPlayerVehicle(-1, false);
     if (GetForegroundWindow() != RsGlobal.ps->window) return;
-    if (!v || !InGarageMenu(v)) {
-        if (g_open) CloseMenu();
-        for (int k : { g_keyMenu, g_keyUp, g_keyDown, g_keyApply, g_keyClose }) g_prev[k & 255] = (GetAsyncKeyState(k) & 0x8000) != 0;
-        return;
-    }
-    if (Pressed(g_keyMenu)) { if (g_open) CloseMenu(); else OpenMenu(); }
-    if (!g_open) { Pressed(g_keyUp); Pressed(g_keyDown); Pressed(g_keyApply); Pressed(g_keyClose); return; }
+    bool garage = GarageMenuActive(v);
+    bool enter = EnterDown(), shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    bool open4 = (GetAsyncKeyState(g_keyMenu) & 0x8000) != 0;
 
-    if (Pressed(g_keyUp))    MoveSel(-1);
-    if (Pressed(g_keyDown))  MoveSel(+1);
-    if (Pressed(g_keyClose)) { CloseMenu(); return; }
-    if (Pressed(g_keyApply)) {
-        const MenuRow& r = g_rows[g_sel];
-        if (r.type == ROW_HEADER) return;
-        if (r.idx == InstalledSlot(v, r.type)) { Msg("Already installed"); return; }
-        auto& list = (r.type == ROW_TINT) ? g_tintPresets : g_neonPresets;
-        int price = g_pricing ? list[r.idx].price : 0;
-        if (price > 0) {
-            if (Money() < price) { Msg("Not enough money!"); return; }
-            SetMoney(Money() - price);
+    if (g_state == ST_CLOSED) {
+        if (garage && open4 && !g_prevOpen) {
+            if (!g_gxtTried) g_gxtReady = InitGxt();
+            if (!g_gxtReady) Notify("~r~TintNeon: game text table not supported");
+            else BuildPanel(ST_MAIN, v);
         }
-        if (r.type == ROW_TINT) ApplyTint(v, r.idx); else ApplyNeon(v, r.idx);
-        Msg("Installed");
-    }
-}
-
-static void DrawMenu() {
-    if (!g_open) return;
-    CVehicle* v = FindPlayerVehicle(-1, false);
-    if (!v) return;
-    float sx = RsGlobal.maximumWidth / 640.f, sy = RsGlobal.maximumHeight / 448.f;
-    float x = 25 * sx, y = 145 * sy, w = 160 * sx, rowH = 15 * sy;   // same spot as the SB handling menu
-    float h = rowH * (g_rows.size() + 2) + 8 * sy;
-
-    CSprite2d::DrawRect(CRect(x, y, x + w, y + h), CRGBA(0, 0, 0, 190));
-    CSprite2d::DrawRect(CRect(x, y, x + w, y + rowH + 2 * sy), CRGBA(30, 30, 30, 230));   // title bar
-    CFont::SetBackground(false, false);
-    CFont::SetFontStyle(FONT_SUBTITLES);
-    CFont::SetProportional(true);
-    CFont::SetScale(0.5f * sx, 0.95f * sy);
-    CFont::SetOrientation(ALIGN_LEFT);
-    CFont::SetColor(CRGBA(255, 255, 255, 255));
-    CFont::PrintString(x + 6 * sx, y + 2 * sy, (char*)"Tint & Neon");
-
-    // column headers
-    float hy = y + rowH + 4 * sy;
-    CFont::SetColor(CRGBA(220, 90, 90, 255));
-    CFont::SetOrientation(ALIGN_LEFT);  CFont::PrintString(x + 6 * sx, hy, (char*)"Variant");
-    if (g_pricing) { CFont::SetOrientation(ALIGN_RIGHT); CFont::SetRightJustifyWrap(0.f); CFont::PrintString(x + w - 6 * sx, hy, (char*)"Price"); }
-
-    for (size_t i = 0; i < g_rows.size(); ++i) {
-        const MenuRow& r = g_rows[i];
-        float ry = hy + rowH * (i + 1);
-        if (r.type == ROW_HEADER) {
-            CFont::SetOrientation(ALIGN_LEFT);
-            CFont::SetColor(CRGBA(255, 190, 60, 255));
-            CFont::PrintString(x + 6 * sx, ry, (char*)(r.idx == 0 ? "- Window Tint -" : "- Neon -"));
-            continue;
+    } else {
+        if (!garage) { ClosePanel(); }
+        else if (g_enterPending) {                           // act when ENTER is released (like the SB script)
+            if (!enter) {
+                g_enterPending = false;
+                if (g_state == ST_MAIN) ClosePanel(); else BuildPanel(ST_MAIN, v);
+            }
         }
-        auto& list = (r.type == ROW_TINT) ? g_tintPresets : g_neonPresets;
-        if ((int)i == g_sel) CSprite2d::DrawRect(CRect(x + 2 * sx, ry, x + w - 2 * sx, ry + rowH - 1 * sy), CRGBA(200, 40, 40, 150));
-        bool installed = (r.idx == InstalledSlot(v, r.type));
-        CFont::SetColor(installed ? CRGBA(130, 130, 130, 255) : CRGBA(255, 255, 255, 255));
-        CFont::SetOrientation(ALIGN_LEFT);
-        CFont::PrintString(x + 12 * sx, ry, (char*)list[r.idx].name.c_str());
-        if (g_pricing) {
-            char pr[16]; if (list[r.idx].price) sprintf(pr, "$%d", list[r.idx].price); else strcpy(pr, "Free");
-            CFont::SetOrientation(ALIGN_RIGHT);
-            CFont::SetRightJustifyWrap(0.f);
-            CFont::PrintString(x + w - 6 * sx, ry, pr);
+        else if (enter && !g_prevEnter) g_enterPending = true;
+        else if (shift && !g_prevShift) {
+            int row = 0; Command<COMMAND_GET_MENU_ITEM_SELECTED>(g_panel, &row);
+            if (row < 0) row = 0;
+            if (g_state == ST_MAIN) BuildPanel(row == 0 ? ST_TINT : ST_NEON, v);
+            else if (row < g_rows) {
+                auto& list = (g_state == ST_TINT) ? g_tintPresets : g_neonPresets;
+                if (row != InstalledSlot(v, g_state)) {
+                    int price = g_pricing ? list[row].price : 0;
+                    if (price > 0 && Money() < price) Notify("~r~Not enough money !~s~");
+                    else {
+                        if (price > 0) SetMoney(Money() - price);
+                        if (g_state == ST_TINT) ApplyTint(v, row); else ApplyNeon(v, row);
+                        RefreshRows(v);
+                    }
+                }
+            }
         }
     }
-    if (g_msgUntil > CTimer::m_snTimeInMilliseconds) {
-        CFont::SetOrientation(ALIGN_LEFT);
-        CFont::SetColor(CRGBA(255, 160, 160, 255));
-        CFont::PrintString(x + 6 * sx, y + h + 3 * sy, g_msg);
-    }
+    g_prevEnter = enter; g_prevShift = shift; g_prevOpen = open4;
 }
 
 // ============================ plugin ============================
@@ -353,7 +391,6 @@ public:
     TintNeon() {
         Events::initRwEvent += [] { LoadConfig(); g_neonTex = MakeNeonTexture(); };
         Events::gameProcessEvent += [] { Update(); };
-        Events::drawHudEvent += [] { DrawMenu(); };
         Events::vehicleRenderEvent.before += TintBefore;
         Events::vehicleRenderEvent.after  += [](CVehicle* v) { TintAfter(v); DrawNeon(v); };
         Events::vehicleDtorEvent += [](CVehicle* v) { g_tint.erase(v); g_neon.erase(v); };
