@@ -215,57 +215,74 @@ static int  Money()         { return CWorld::Players[0].m_nMoney; }
 static void SetMoney(int m) { CWorld::Players[0].m_nMoney = m; }
 
 static const int NSLOT = 28;           // 0 title, 1 header "Variant", 2 header "Price", 3..14 rows, 15..26 prices
-struct GxtSlot { char key[9]; uint32_t* offPtr; uint32_t origOff; char text[48]; };
-static GxtSlot  g_slot[NSLOT];
-static uint8_t* g_dataBase = nullptr;
-static bool     g_gxtReady = false, g_gxtTried = false;
+struct GxtSlot { char key[9]; char text[48]; };
+static GxtSlot g_slot[NSLOT];
 
-static bool InitGxt() {
-    g_gxtTried = true;
-    uint8_t* base = (uint8_t*)&TheText;
-    if (IsBadReadPtr(base, 32)) return false;
-    uint8_t* entries = *(uint8_t**)(base + 0);
-    uint32_t count   = *(uint32_t*)(base + 4);
-    if (!entries || IsBadReadPtr(entries, 12) || count < 300 || count > 1000000) return false;
-    struct Lay { int off, key; } lays[] = { {0, 4}, {8, 0} };
-    int dataOffs[] = { 8, 12, 16, 20, 24 };
-    for (auto& lay : lays) for (int dOff : dataOffs) {
-        uint8_t* data = *(uint8_t**)(base + dOff);
-        if (!data || IsBadReadPtr(data, 16)) continue;
-        int tested = 0, ok = 0;
-        for (uint32_t i = count / 5; i < count && tested < 6; i += count / 9 + 1) {
-            uint8_t* e = entries + (size_t)i * 12;
-            char k[9]; memcpy(k, e + lay.key, 8); k[8] = 0;
-            if (!k[0]) continue;
-            uint32_t off = *(uint32_t*)(e + lay.off);
-            const uint8_t* p = (const uint8_t*)TheText.Get(k);
-            ++tested;
-            if (p == data + off) ++ok;
-        }
-        if (tested < 4 || ok != tested) continue;
-        // layout verified -> collect unused frontend keys
-        int n = 0;
-        for (uint32_t i = 0; i < count && n < NSLOT; ++i) {
-            uint8_t* e = entries + (size_t)i * 12;
-            if (memcmp(e + lay.key, "FEM_", 4) != 0) continue;
-            GxtSlot& sl = g_slot[n];
-            memcpy(sl.key, e + lay.key, 8); sl.key[8] = 0;
-            sl.offPtr = (uint32_t*)(e + lay.off);
-            sl.origOff = *sl.offPtr;
-            sl.text[0] = 0;
-            ++n;
-        }
-        if (n < NSLOT) return false;
-        g_dataBase = data;
-        return true;
+// San Andreas GXT keys are CRC hashes sorted in tkeyMain.  While the menu is open we swap in a copy of that
+// table that also contains our own keys (TNT00..TNT27) pointing at our text buffers; restored on close.
+static tGXT_VERSION_2_TKEY_item* g_oldKeys = nullptr;
+static short g_oldSize = 0;
+static std::vector<tGXT_VERSION_2_TKEY_item> g_newKeys;
+static bool g_gxtActive = false;
+static int  g_hashMode = -1;           // remembered after first successful calibration
+static intptr_t g_posAdjust = 0;
+
+static uint32_t CrcKey(const char* s, bool inv) {
+    static uint32_t tab[256]; static bool init = false;
+    if (!init) { for (uint32_t i = 0; i < 256; ++i) { uint32_t c = i; for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1); tab[i] = c; } init = true; }
+    uint32_t k = 0xFFFFFFFFu;
+    for (; *s; ++s) k = tab[(k ^ (uint8_t)toupper((unsigned char)*s)) & 0xFF] ^ (k >> 8);
+    return inv ? ~k : k;
+}
+static void BuildKeyTable(bool inv, intptr_t adjust) {
+    g_newKeys.assign(g_oldKeys, g_oldKeys + g_oldSize);
+    char* base = TheText.tdatMain.data;
+    for (int i = 0; i < NSLOT; ++i) {
+        tGXT_VERSION_2_TKEY_item it;
+        it.Position = (unsigned long)((intptr_t)(g_slot[i].text - base) - adjust);
+        it.KeyHash  = CrcKey(g_slot[i].key, inv);
+        g_newKeys.push_back(it);
     }
+    std::sort(g_newKeys.begin(), g_newKeys.end(),
+              [](const tGXT_VERSION_2_TKEY_item& a, const tGXT_VERSION_2_TKEY_item& b) { return a.KeyHash < b.KeyHash; });
+    TheText.tkeyMain.data = g_newKeys.data();
+    TheText.tkeyMain.size = (short)(g_oldSize + NSLOT);
+}
+static bool KeysResolve() {
+    return TheText.Get(g_slot[0].key) == g_slot[0].text && TheText.Get(g_slot[1].key) == g_slot[1].text &&
+           TheText.Get(g_slot[14].key) == g_slot[14].text;
+}
+static bool ApplyGxt() {
+    if (g_gxtActive) return true;
+    auto& tk = TheText.tkeyMain;
+    if (!tk.data || !TheText.tdatMain.data || tk.size < 100 || tk.size + NSLOT > 32000) return false;
+    for (int i = 0; i < NSLOT; ++i) sprintf(g_slot[i].key, "TNT%02d", i);
+    g_oldKeys = tk.data; g_oldSize = tk.size;
+    for (int mode = 0; mode < 2; ++mode) {
+        if (g_hashMode >= 0 && mode != g_hashMode) continue;
+        bool inv = (mode == 1);
+        intptr_t adjust = (g_hashMode >= 0) ? g_posAdjust : 0;
+        BuildKeyTable(inv, adjust);
+        if (KeysResolve()) { g_hashMode = mode; g_posAdjust = adjust; g_gxtActive = true; return true; }
+        // maybe Get() adds a constant to Position: measure it and retry once
+        const char* r = TheText.Get(g_slot[0].key);
+        if (r && g_hashMode < 0) {
+            intptr_t delta = (intptr_t)r - (intptr_t)g_slot[0].text;
+            if (delta != 0 && delta > -0x100000 && delta < 0x100000) {
+                BuildKeyTable(inv, delta);
+                if (KeysResolve()) { g_hashMode = mode; g_posAdjust = delta; g_gxtActive = true; return true; }
+            }
+        }
+    }
+    tk.data = g_oldKeys; tk.size = g_oldSize;       // could not make the game resolve our keys: undo
     return false;
 }
-static void SetText(int i, const char* t) {
-    strncpy(g_slot[i].text, t, 47); g_slot[i].text[47] = 0;
-    *g_slot[i].offPtr = (uint32_t)((uint8_t*)g_slot[i].text - g_dataBase);
+static void RemoveGxt() {
+    if (!g_gxtActive) return;
+    TheText.tkeyMain.data = g_oldKeys; TheText.tkeyMain.size = g_oldSize;
+    g_gxtActive = false;
 }
-static void RestoreTexts() { for (int i = 0; i < NSLOT; ++i) if (g_slot[i].offPtr) *g_slot[i].offPtr = g_slot[i].origOff; }
+static void SetText(int i, const char* t) { strncpy(g_slot[i].text, t, 47); g_slot[i].text[47] = 0; }
 
 // ---- garage menu plumbing (same memory writes as the SB handling script) ----
 static void WriteU8(uintptr_t a, uint8_t v)   { DWORD o; VirtualProtect((void*)a, 1, PAGE_EXECUTE_READWRITE, &o); *(uint8_t*)a = v;  VirtualProtect((void*)a, 1, o, &o); }
@@ -336,7 +353,7 @@ static void BuildPanel(int state, CVehicle* v) {
 }
 static void ClosePanel() {
     DestroyPanel();
-    RestoreTexts();
+    RemoveGxt();
     if (g_leftHidden) { WriteU16(0x582645, 0xDB32); g_leftHidden = false; }
     WriteU8(0xBA82E2, 0);                                   // back to the stock menu
     g_state = ST_CLOSED; g_enterPending = false;
@@ -351,8 +368,7 @@ static void Update() {
 
     if (g_state == ST_CLOSED) {
         if (garage && open4 && !g_prevOpen) {
-            if (!g_gxtTried) g_gxtReady = InitGxt();
-            if (!g_gxtReady) Notify("~r~TintNeon: game text table not supported");
+            if (!ApplyGxt()) Notify("~r~TintNeon: could not add menu text");
             else BuildPanel(ST_MAIN, v);
         }
     } else {
