@@ -44,6 +44,7 @@
 #include <cstdio>
 
 using namespace plugin;
+static void Log(const char* fmt, ...);
 
 // ============================ data ============================
 struct Preset { std::string name; int r, g, b, a, mode, price; };
@@ -106,6 +107,8 @@ static void LoadConfig() {
 // ============================ glass tint ============================
 struct Saved { RpMaterial* mat; RwRGBA col; };
 static std::vector<Saved> g_saved;
+static int  g_tintHits = 0;
+static bool g_tintLogged = false;
 
 static bool IsEditableKey(const RwRGBA& c) {
     return (c.red == 60  && c.green == 255 && c.blue == 0)   || (c.red == 255 && c.green == 0   && c.blue == 175) ||
@@ -117,6 +120,7 @@ static bool IsGlass(RpMaterial* m) { const RwRGBA* c = &m->color; return c->alph
 static RpMaterial* MatCB(RpMaterial* m, void* d) {
     if (!IsGlass(m)) return m;
     const TintState* t = (const TintState*)d;
+    ++g_tintHits;
     g_saved.push_back({ m, m->color });
     RwRGBA c = { (RwUInt8)t->r, (RwUInt8)t->g, (RwUInt8)t->b, (RwUInt8)t->a };
     m->color = c;
@@ -129,7 +133,9 @@ static RpAtomic* AtomicCB(RpAtomic* a, void* d) {
 static void TintBefore(CVehicle* v) {
     auto it = g_tint.find(v);
     if (it == g_tint.end() || it->second.a <= 0 || !v->m_pRwClump) return;
+    g_tintHits = 0;
     RpClumpForAllAtomics(v->m_pRwClump, AtomicCB, &it->second);   // materials are shared per model -> restore after
+    if (!g_tintLogged) { g_tintLogged = true; Log("tint render: vehicle %p, glass materials tinted = %d", (void*)v, g_tintHits); }
 }
 static void TintAfter(CVehicle*) {
     for (auto& s : g_saved) s.mat->color = s.col;
@@ -197,13 +203,37 @@ static void DrawNeon(CVehicle* v) {
         (short)(n.a * fade), (uint8_t)r, (uint8_t)g, (uint8_t)b, 6.0f, false, 1.0f, nullptr, true);
 }
 
+
+// ---- diagnostics: list every material of the vehicle once per model (written to TintNeon.log)
+static RpMaterial* DumpMatCB(RpMaterial* m, void*) {
+    Log("    material tex=%s rgba=%d,%d,%d,%d glass=%d", m->texture ? m->texture->name : "(none)",
+        m->color.red, m->color.green, m->color.blue, m->color.alpha, (int)IsGlass(m));
+    return m;
+}
+static RpAtomic* DumpAtomicCB(RpAtomic* a, void*) {
+    Log("  atomic %p", (void*)a);
+    if (RpGeometry* g = RpAtomicGetGeometry(a)) RpGeometryForAllMaterials(g, DumpMatCB, nullptr);
+    return a;
+}
+static void DumpVehicle(CVehicle* v) {
+    static std::vector<int> done;
+    if (!v || !v->m_pRwClump) return;
+    if (std::find(done.begin(), done.end(), (int)v->m_nModelIndex) != done.end()) return;
+    done.push_back(v->m_nModelIndex);
+    Log("=== materials of model %d", (int)v->m_nModelIndex);
+    RpClumpForAllAtomics(v->m_pRwClump, DumpAtomicCB, nullptr);
+}
+
 // ============================ apply ============================
 static void ApplyTint(CVehicle* v, int row) {
     const Preset& p = g_tintPresets[row];
     g_tint[v] = { p.r, p.g, p.b, p.a, row };
+    g_tintLogged = false;
+    Log("ApplyTint veh=%p row=%d rgba=%d,%d,%d,%d", (void*)v, row, p.r, p.g, p.b, p.a);
 }
 static void ApplyNeon(CVehicle* v, int row) {
     const Preset& p = g_neonPresets[row];
+    Log("ApplyNeon veh=%p row=%d rgba=%d,%d,%d,%d mode=%d texture=%p", (void*)v, row, p.r, p.g, p.b, p.a, p.mode, (void*)g_neonTex);
     if (p.mode == -2) { g_neon.erase(v); return; }
     g_neon[v] = { p.r, p.g, p.b, p.a, p.mode, row };
 }
@@ -313,6 +343,7 @@ static bool GarageMenuActive(CVehicle* v) { return v && *(uint8_t*)0xBA82E3 > 0;
 
 enum { ST_CLOSED, ST_MAIN, ST_TINT, ST_NEON };
 static int  g_state = ST_CLOSED, g_panel = -1, g_rows = 0;
+static uint16_t g_origLeft = 0xDB32;
 static bool g_leftHidden = false, g_enterPending = false, g_prevEnter = false, g_prevShift = false, g_prevOpen = false;
 
 static bool EnterDown() {
@@ -376,13 +407,18 @@ static void BuildPanel(int state, CVehicle* v) {
     Command<COMMAND_SET_ACTIVE_MENU_ITEM>(g_panel, 0);
     uint32_t cur = *(uint32_t*)0xBA82DC;                    // tell the menu system how many rows it has
     if (cur) *(uint8_t*)(cur + 0x3F6) = (uint8_t)(g_rows - 1);
-    if (!g_leftHidden && *(uint16_t*)0x582645 == 0xDB32) { WriteU16(0x582645, 0x01B3); g_leftHidden = true; }   // hide left (stock tuning) menu
+    if (!g_leftHidden) {                                    // hide the stock (left) tuning menu, same patch as the SB script
+        uint16_t now = *(uint16_t*)0x582645;
+        g_origLeft = (now == 0x01B3) ? 0xDB32 : now;
+        Log("left-menu draw byte was %04X, hiding it", now);
+        WriteU16(0x582645, 0x01B3); g_leftHidden = true;
+    }
     RefreshRows(v);
 }
 static void ClosePanel() {
     DestroyPanel();
     RemoveGxt();
-    if (g_leftHidden) { WriteU16(0x582645, 0xDB32); g_leftHidden = false; }
+    if (g_leftHidden) { WriteU16(0x582645, g_origLeft); g_leftHidden = false; }
     WriteU8(0xBA82E2, 0);                                   // back to the stock menu
     g_state = ST_CLOSED; g_enterPending = false;
 }
@@ -397,7 +433,7 @@ static void Update() {
     if (g_state == ST_CLOSED) {
         if (garage && open4 && !g_prevOpen) {
             if (!ApplyGxt()) Notify("~r~TintNeon: could not add menu text");
-            else BuildPanel(ST_MAIN, v);
+            else { DumpVehicle(v); BuildPanel(ST_MAIN, v); }
         }
     } else {
         if (!garage) { ClosePanel(); }
@@ -421,6 +457,7 @@ static void Update() {
                         if (price > 0) SetMoney(Money() - price);
                         if (g_state == ST_TINT) ApplyTint(v, row); else ApplyNeon(v, row);
                         RefreshRows(v);
+                        Notify(g_state == ST_TINT ? "Window tint installed" : "Neon installed");
                     }
                 }
             }
