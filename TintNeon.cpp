@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <cstdarg>
 #include <cctype>
 #include <cstdlib>
 #include <windows.h>
@@ -234,12 +235,20 @@ static uint32_t CrcKey(const char* s, bool inv) {
     for (; *s; ++s) k = tab[(k ^ (uint8_t)toupper((unsigned char)*s)) & 0xFF] ^ (k >> 8);
     return inv ? ~k : k;
 }
-static void BuildKeyTable(bool inv, intptr_t adjust) {
+static void Log(const char* fmt, ...) {
+    std::string path = IniPath(); path = path.substr(0, path.find_last_of("\\/") + 1) + "TintNeon.log";
+    FILE* f = fopen(path.c_str(), "a"); if (!f) return;
+    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap); fputc('\n', f); fclose(f);
+}
+// absolute = Position holds the string's address (what the SDK's patchOffsets suggests);
+// otherwise Position is an offset from tdatMain.data (+ adjust)
+static void BuildKeyTable(bool inv, bool absolute, intptr_t adjust) {
     g_newKeys.assign(g_oldKeys, g_oldKeys + g_oldSize);
     char* base = TheText.tdatMain.data;
     for (int i = 0; i < NSLOT; ++i) {
         tGXT_VERSION_2_TKEY_item it;
-        it.Position = (unsigned long)((intptr_t)(g_slot[i].text - base) - adjust);
+        it.Position = absolute ? (unsigned long)(uintptr_t)g_slot[i].text
+                               : (unsigned long)((intptr_t)(g_slot[i].text - base) - adjust);
         it.KeyHash  = CrcKey(g_slot[i].key, inv);
         g_newKeys.push_back(it);
     }
@@ -252,29 +261,41 @@ static bool KeysResolve() {
     return TheText.Get(g_slot[0].key) == g_slot[0].text && TheText.Get(g_slot[1].key) == g_slot[1].text &&
            TheText.Get(g_slot[14].key) == g_slot[14].text;
 }
+// remembered working combination
+static bool g_calibrated = false, g_okInv = false, g_okAbs = true; static intptr_t g_okAdj = 0;
+
+static bool TryCombo(bool inv, bool absolute, intptr_t adjust) {
+    BuildKeyTable(inv, absolute, adjust);
+    bool ok = KeysResolve();
+    const char* r = TheText.Get(g_slot[0].key);
+    Log("try inv=%d abs=%d adj=%lld -> Get=%p expected=%p %s", (int)inv, (int)absolute, (long long)adjust, (const void*)r, (const void*)g_slot[0].text, ok ? "OK" : "no");
+    if (ok) { g_calibrated = true; g_okInv = inv; g_okAbs = absolute; g_okAdj = adjust; }
+    return ok;
+}
 static bool ApplyGxt() {
     if (g_gxtActive) return true;
     auto& tk = TheText.tkeyMain;
-    if (!tk.data || !TheText.tdatMain.data || tk.size < 100 || tk.size + NSLOT > 32000) return false;
-    for (int i = 0; i < NSLOT; ++i) sprintf(g_slot[i].key, "TNT%02d", i);
+    Log("--- ApplyGxt: tkeyMain.data=%p size=%d tdat=%p", (void*)tk.data, (int)tk.size, (void*)TheText.tdatMain.data);
+    if (!tk.data || tk.size < 100 || tk.size + NSLOT > 32000) { Log("table pointer/size not usable"); return false; }
+    for (int i = 0; i < NSLOT; ++i) { sprintf(g_slot[i].key, "TNT%02d", i); if (!g_slot[i].text[0]) strcpy(g_slot[i].text, "-"); }
     g_oldKeys = tk.data; g_oldSize = tk.size;
-    for (int mode = 0; mode < 2; ++mode) {
-        if (g_hashMode >= 0 && mode != g_hashMode) continue;
-        bool inv = (mode == 1);
-        intptr_t adjust = (g_hashMode >= 0) ? g_posAdjust : 0;
-        BuildKeyTable(inv, adjust);
-        if (KeysResolve()) { g_hashMode = mode; g_posAdjust = adjust; g_gxtActive = true; return true; }
-        // maybe Get() adds a constant to Position: measure it and retry once
-        const char* r = TheText.Get(g_slot[0].key);
-        if (r && g_hashMode < 0) {
+
+    bool ok = false;
+    if (g_calibrated) ok = TryCombo(g_okInv, g_okAbs, g_okAdj);
+    for (int inv = 0; inv < 2 && !ok; ++inv) {
+        ok = TryCombo(inv != 0, true, 0);                            // absolute addresses
+        if (ok) break;
+        if (TheText.tdatMain.data) {
+            ok = TryCombo(inv != 0, false, 0);                       // offsets from TDAT
+            if (ok) break;
+            const char* r = TheText.Get(g_slot[0].key);              // maybe a constant is added: measure it
             intptr_t delta = (intptr_t)r - (intptr_t)g_slot[0].text;
-            if (delta != 0 && delta > -0x100000 && delta < 0x100000) {
-                BuildKeyTable(inv, delta);
-                if (KeysResolve()) { g_hashMode = mode; g_posAdjust = delta; g_gxtActive = true; return true; }
-            }
+            if (r && delta != 0 && delta > -0x100000 && delta < 0x100000) ok = TryCombo(inv != 0, false, delta);
         }
     }
+    if (ok) { g_gxtActive = true; Log("ApplyGxt OK"); return true; }
     tk.data = g_oldKeys; tk.size = g_oldSize;       // could not make the game resolve our keys: undo
+    Log("ApplyGxt FAILED (table restored)");
     return false;
 }
 static void RemoveGxt() {
