@@ -308,7 +308,8 @@ static void SetText(int i, const char* t) { strncpy(g_slot[i].text, t, 47); g_sl
 // ---- garage menu plumbing (same memory writes as the SB handling script) ----
 static void WriteU8(uintptr_t a, uint8_t v)   { DWORD o; VirtualProtect((void*)a, 1, PAGE_EXECUTE_READWRITE, &o); *(uint8_t*)a = v;  VirtualProtect((void*)a, 1, o, &o); }
 static void WriteU16(uintptr_t a, uint16_t v) { DWORD o; VirtualProtect((void*)a, 2, PAGE_EXECUTE_READWRITE, &o); *(uint16_t*)a = v; VirtualProtect((void*)a, 2, o, &o); }
-static bool GarageMenuActive(CVehicle* v) { return v && (g_anywhere || *(uint8_t*)0xBA82E3 > 0); }
+// the game's menu system only has valid data while the garage menu is open: never touch it otherwise
+static bool GarageMenuActive(CVehicle* v) { return v && *(uint8_t*)0xBA82E3 > 0; }
 
 enum { ST_CLOSED, ST_MAIN, ST_TINT, ST_NEON };
 static int  g_state = ST_CLOSED, g_panel = -1, g_rows = 0;
@@ -365,6 +366,12 @@ static void BuildPanel(int state, CVehicle* v) {
             (char*)g_slot[15].key, (char*)g_slot[16].key, (char*)g_slot[17].key, (char*)g_slot[18].key, (char*)g_slot[19].key, (char*)g_slot[20].key,
             (char*)g_slot[21].key, (char*)g_slot[22].key, (char*)g_slot[23].key, (char*)g_slot[24].key, (char*)g_slot[25].key, (char*)g_slot[26].key);
 
+    if (*(uint32_t*)0xBA82DC == 0) {                        // menu system has no data -> not a real garage menu: abort safely
+        DestroyPanel(); RemoveGxt(); g_state = ST_CLOSED;
+        Log("BuildPanel aborted: 0xBA82DC is null");
+        Notify("~r~Open this inside a tuning garage");
+        return;
+    }
     WriteU8(0xBA82E2, 1);                                   // make our panel the active menu
     Command<COMMAND_SET_ACTIVE_MENU_ITEM>(g_panel, 0);
     uint32_t cur = *(uint32_t*)0xBA82DC;                    // tell the menu system how many rows it has
